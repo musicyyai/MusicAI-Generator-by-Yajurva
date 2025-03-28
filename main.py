@@ -6,254 +6,299 @@ import sys
 import requests # For making HTTP requests (e.g., Telegram, maybe others)
 import subprocess # For running shell commands (like Kaggle CLI, ffmpeg/sox if needed locally)
 from datetime import datetime # For timestamps
+import random
+
 # Add these below existing imports
-from utils import load_state, save_state, authenticate_gdrive, upload_to_gdrive # Import utils functions
-from config import GDRIVE_BACKUP_FOLDER_ID # Import the folder ID
+# <<< UPDATED IMPORT LIST >>>
+from utils import (
+    load_state, save_state,
+    authenticate_gdrive, upload_to_gdrive,
+    setup_kaggle_api, trigger_kaggle_notebook, download_kaggle_output,
+    check_kaggle_status,
+    get_spotify_trending_keywords # <<< ADDED SPOTIFY FUNCTION IMPORT >>>
+)
+# <<< UPDATED CONFIG IMPORT >>>
+from config import (
+    GDRIVE_BACKUP_FOLDER_ID,
+    PROMPT_GENRES, PROMPT_INSTRUMENTS, PROMPT_MOODS, PROMPT_TEMPLATES # Import prompt lists
+)
 
 # --- Logging Configuration ---
 LOG_FILE_PATH = "system_log.txt"
 LOG_FORMAT = '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
-# Note: Using filename and lineno can be slightly slower, remove if performance is critical
-
 logging.basicConfig(
-    level=logging.INFO, # Set the minimum level of messages to record (e.g., INFO, WARNING, ERROR)
+    level=logging.INFO,
     format=LOG_FORMAT,
     handlers=[
-        logging.FileHandler(LOG_FILE_PATH, encoding='utf-8'), # Log to file
-        logging.StreamHandler(sys.stdout) # Also log to console (stdout)
+        logging.FileHandler(LOG_FILE_PATH, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
     ]
 )
-
-logging.info("Logging configured.") # First message using the configured logger
+logging.info("Logging configured.")
 
 # --- Load Secrets from Environment Variables ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
-GOOGLE_CREDS_JSON_STR = os.environ.get('GOOGLE_CREDS_JSON') # Load as string first
+GOOGLE_CREDS_JSON_STR = os.environ.get('GOOGLE_CREDS_JSON')
 KAGGLE_JSON_1_STR = os.environ.get('KAGGLE_JSON_1')
 KAGGLE_JSON_2_STR = os.environ.get('KAGGLE_JSON_2')
 KAGGLE_JSON_3_STR = os.environ.get('KAGGLE_JSON_3')
 KAGGLE_JSON_4_STR = os.environ.get('KAGGLE_JSON_4')
+# <<< ADDED SPOTIFY SECRETS LOADING >>>
+SPOTIPY_CLIENT_ID = os.environ.get('SPOTIPY_CLIENT_ID')
+SPOTIPY_CLIENT_SECRET = os.environ.get('SPOTIPY_CLIENT_SECRET')
+
 
 # --- Validate Secrets ---
-if not TELEGRAM_BOT_TOKEN:
-    logging.critical("CRITICAL ERROR: Telegram Bot Token not found in Replit Secrets.")
-    sys.exit(1) # Exit script with an error code
-
-if not TELEGRAM_CHAT_ID:
-    logging.critical("CRITICAL ERROR: Telegram Chat ID not found in Replit Secrets.")
-    sys.exit(1)
-
-if not GOOGLE_CREDS_JSON_STR:
-    logging.critical("CRITICAL ERROR: Google Drive Credentials JSON not found in Replit Secrets.")
-    sys.exit(1)
-
-# Store Kaggle credentials in a list for easier access by index
-KAGGLE_CREDENTIALS_LIST = [
-    KAGGLE_JSON_1_STR,
-    KAGGLE_JSON_2_STR,
-    KAGGLE_JSON_3_STR,
-    KAGGLE_JSON_4_STR
-]
-
-# Check if at least one Kaggle credential was loaded
-if not any(KAGGLE_CREDENTIALS_LIST):
-     logging.critical("CRITICAL ERROR: No Kaggle API credentials found in Replit Secrets (KAGGLE_JSON_1 to KAGGLE_JSON_4).")
-     sys.exit(1)
-
-# Optional: Check if ALL expected Kaggle credentials were loaded (stricter)
-if None in KAGGLE_CREDENTIALS_LIST:
-    logging.warning("One or more Kaggle API credentials (KAGGLE_JSON_1 to KAGGLE_JSON_4) are missing. Rotation might fail.")
-    # We don't exit here, maybe the user only configured some accounts
-
+if not TELEGRAM_BOT_TOKEN: logging.critical("CRITICAL ERROR: Telegram Bot Token not found..."); sys.exit(1)
+if not TELEGRAM_CHAT_ID: logging.critical("CRITICAL ERROR: Telegram Chat ID not found..."); sys.exit(1)
+if not GOOGLE_CREDS_JSON_STR: logging.critical("CRITICAL ERROR: Google Drive Credentials JSON not found..."); sys.exit(1)
+# <<< ADDED SPOTIFY SECRET VALIDATION >>>
+if not SPOTIPY_CLIENT_ID: logging.warning("Spotify Client ID not found. Spotify features disabled.")
+if not SPOTIPY_CLIENT_SECRET: logging.warning("Spotify Client Secret not found. Spotify features disabled.")
+# --- Kaggle Validation ---
+KAGGLE_CREDENTIALS_LIST = [ KAGGLE_JSON_1_STR, KAGGLE_JSON_2_STR, KAGGLE_JSON_3_STR, KAGGLE_JSON_4_STR ]
+if not any(KAGGLE_CREDENTIALS_LIST): logging.critical("CRITICAL ERROR: No Kaggle API credentials found..."); sys.exit(1)
+if None in KAGGLE_CREDENTIALS_LIST: logging.warning("One or more Kaggle API credentials missing...")
 logging.info("Secrets loaded successfully.")
-# Confirmation message
 
 # --- Parse JSON Credentials (Important!) ---
-# Make GOOGLE_CREDS_INFO global or pass it if needed elsewhere, defined here for auth flow
 GOOGLE_CREDS_INFO = None
 try:
     GOOGLE_CREDS_INFO = json.loads(GOOGLE_CREDS_JSON_STR)
     logging.info("Google credentials JSON parsed successfully.")
 except json.JSONDecodeError as e:
-    logging.critical(f"CRITICAL ERROR: Failed to parse Google credentials JSON: {e}")
-    sys.exit(1)
-
-# We will parse Kaggle JSON later, just before using it, as we rotate accounts.
-
+    logging.critical(f"CRITICAL ERROR: Failed to parse Google credentials JSON: {e}"); sys.exit(1)
 
 # --- Default State Definition ---
 DEFAULT_STATE = {
-    "status": "stopped", # running, stopped, stopping, error, stopped_exhausted
-    "active_kaggle_account_index": 0, # Index (0-3) for KAGGLE_CREDENTIALS_LIST
-    "active_drive_account_index": 0, # Index for Google Drive (currently only 0)
-    "current_step": "idle", # e.g., idle, selecting_style, generating, processing, uploading
-    "current_instrument": None, # Name of the instrument being generated
-    "last_kaggle_run_id": None, # ID of the last triggered Kaggle kernel run
-    "retry_count": 0, # Counter for retrying the current step
-    "total_tracks_generated": 0, # Counter for successful generations
-    "style_profile_id": "default", # Identifier for the current style profile
-    "fallback_active": False, # True if running on Gitpod fallback
-    "kaggle_usage": [ # List to track usage per account
-        {"account_index": 0, "gpu_hours_used_this_week": 0.0, "last_reset_time": None},
-        {"account_index": 1, "gpu_hours_used_this_week": 0.0, "last_reset_time": None},
-        {"account_index": 2, "gpu_hours_used_this_week": 0.0, "last_reset_time": None},
-        {"account_index": 3, "gpu_hours_used_this_week": 0.0, "last_reset_time": None},
-    ],
-    "last_error": None, # Store details of the last significant error
-    "_checksum": None # Placeholder for checksum if implemented
+    "status": "stopped", "active_kaggle_account_index": 0, "active_drive_account_index": 0,
+    "current_step": "idle", "current_prompt": None,
+    "last_kaggle_run_id": None, "last_kaggle_trigger_time": None,
+    "last_downloaded_wav": None,
+    "retry_count": 0, "total_tracks_generated": 0, "style_profile_id": "default",
+    "fallback_active": False, "kaggle_usage": [
+        {"account_index": i, "gpu_hours_used_this_week": 0.0, "last_reset_time": None} for i in range(4)
+    ], "last_error": None, "_checksum": None
 }
+STATE_FILE_PATH = "state.txt"
 
-STATE_FILE_PATH = "state.txt" # Define the filename
+# --- Kaggle Notebook Slug ---
+KAGGLE_NOTEBOOK_SLUG = "musicyyai/notebook63936fc364" # Your specific slug
+
+
+# <<< UPDATED PROMPT GENERATION FUNCTION with Spotify Integration >>>
+def generate_riffusion_prompt(use_spotify=True):
+    """
+    Generates a text prompt for Riffusion, optionally using Spotify keywords.
+    Falls back to random combinations if Spotify fails or is disabled.
+
+    Args:
+        use_spotify (bool): Whether to attempt fetching keywords from Spotify.
+
+    Returns:
+        str: A generated text prompt.
+    """
+    # Check if Spotify credentials exist before attempting to use
+    spotify_available = SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET
+    spotify_keywords = []
+
+    if use_spotify and spotify_available:
+        logging.info("Attempting to fetch keywords from Spotify...")
+        # Note: get_spotify_trending_keywords handles its own auth via get_spotify_client
+        spotify_keywords = get_spotify_trending_keywords(limit=15)
+        if not spotify_keywords:
+             logging.warning("Failed to get keywords from Spotify or none found. Falling back to default lists.")
+    elif use_spotify and not spotify_available:
+        logging.warning("Spotify use requested, but credentials not found. Falling back to default lists.")
+
+    try:
+        template = random.choice(PROMPT_TEMPLATES)
+
+        # --- Choose Elements ---
+        potential_genres = [k for k in spotify_keywords if k in PROMPT_GENRES]
+        if potential_genres: genre = random.choice(potential_genres); logging.debug(f"Using Spotify-sourced genre: {genre}")
+        elif PROMPT_GENRES: genre = random.choice(PROMPT_GENRES); logging.debug("Using random genre from config.")
+        else: genre = "music"
+
+        if PROMPT_INSTRUMENTS: instrument = random.choice(PROMPT_INSTRUMENTS); logging.debug("Using random instrument from config.")
+        else: instrument = "sound"
+
+        potential_moods = [k for k in spotify_keywords if k in PROMPT_MOODS]
+        if potential_moods: mood = random.choice(potential_moods); logging.debug(f"Using Spotify-sourced mood: {mood}")
+        elif PROMPT_MOODS: mood = random.choice(PROMPT_MOODS); logging.debug("Using random mood from config.")
+        else: mood = "neutral"
+
+        # --- Format Prompt ---
+        prompt = template.format(genre=genre, instrument=instrument, mood=mood)
+
+        logging.info(f"Generated prompt: '{prompt}' using template: '{template}'")
+        return prompt
+
+    except IndexError:
+        logging.error("Prompt generation failed: One or more keyword lists might be empty in config.")
+        return "default synth music"
+    except Exception as e:
+        logging.error(f"Error during prompt generation: {e}", exc_info=True)
+        return "default synth music"
 
 
 # --- Main Application Logic ---
-
-# Modified function signature to accept state and service
 def run_main_cycle(current_state, gdrive_service):
     """Performs one cycle of the main application logic."""
     logging.info(f"--- Cycle Start: {datetime.now()} ---")
-
-    # Use the passed state dictionary
-    status = current_state.get("status", "error") # Safely get status
+    status = current_state.get("status", "error")
 
     # --- Status Checks ---
-    if status == "stopped":
-        logging.info("System status is 'stopped'. Cycle skipped.")
-        # No sleep needed here, main loop handles sleep
-        return current_state # Return unmodified state
-
+    if status == "stopped": logging.info("System status is 'stopped'. Cycle skipped."); return current_state
     if status == "stopping":
         logging.info("System status is 'stopping'. Finishing cycle and stopping.")
-        current_state["status"] = "stopped" # Update status
-        save_state(current_state, STATE_FILE_PATH) # Save final stopped state
-        logging.info("System status set to 'stopped'.")
-        # Let the main loop handle exit or sleep based on final status
-        return current_state
-
-    if status == "stopped_exhausted":
-        logging.info("System status is 'stopped_exhausted'. Waiting for manual restart. Cycle skipped.")
-        # TODO: Add check for quota reset time?
-        return current_state # Return unmodified state
-
-    # If status is 'running' or potentially 'error', proceed with tasks
+        current_state["status"] = "stopped"; save_state(current_state, STATE_FILE_PATH)
+        logging.info("System status set to 'stopped'."); return current_state
+    if status == "stopped_exhausted": logging.info("System status is 'stopped_exhausted'. Cycle skipped."); return current_state
 
     # --- Backup Logic ---
-    # Example: Backup state and log file periodically (e.g., every hour or after N cycles)
-    # We'll add a simple counter for now, backup every cycle for testing
-    backup_now = True # Placeholder - add proper timing logic later (e.g., check time/cycle count)
-
+    backup_now = True # Placeholder
     if backup_now and gdrive_service:
+        # ... (Backup logic remains the same) ...
         logging.info("Attempting periodic backup...")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        # Backup state file
-        state_backup_filename = f"state_{timestamp}.json" # Use .json extension
-        # Save current state locally BEFORE uploading backup
+        state_backup_filename = f"state_{timestamp}.json"
         if save_state(current_state, STATE_FILE_PATH):
              logging.info(f"Attempting to upload state backup: {state_backup_filename}")
              upload_to_gdrive(gdrive_service, STATE_FILE_PATH, GDRIVE_BACKUP_FOLDER_ID, state_backup_filename)
-             # TODO: Add check for upload success/failure
-        else:
-             logging.error("Failed to save local state before backup. Skipping state backup.")
-
-        # Backup log file
+        else: logging.error("Failed to save local state before backup. Skipping state backup.")
         log_backup_filename = f"system_log_{timestamp}.txt"
         logging.info(f"Attempting to upload log backup: {log_backup_filename}")
-        # Make sure the log handler has flushed recent messages before copying/uploading
-        # For basic FileHandler, closing/reopening or flushing might be needed for robustness
-        # For simplicity now, we just upload the current file content
-        # Ensure log file exists before uploading
-        if os.path.exists(LOG_FILE_PATH):
-            upload_to_gdrive(gdrive_service, LOG_FILE_PATH, GDRIVE_BACKUP_FOLDER_ID, log_backup_filename)
-            # TODO: Add check for upload success/failure
+        if os.path.exists(LOG_FILE_PATH): upload_to_gdrive(gdrive_service, LOG_FILE_PATH, GDRIVE_BACKUP_FOLDER_ID, log_backup_filename)
+        else: logging.warning(f"Log file {LOG_FILE_PATH} not found. Skipping log backup.")
+
+    # --- Main Task Execution (Kaggle Trigger / Monitoring) ---
+    logging.info("Starting main task execution...")
+    current_step = current_state.get("current_step", "idle")
+
+    if current_step == "idle":
+        logging.info("Current step is 'idle'. Preparing for Kaggle run.")
+        active_kaggle_index = current_state.get("active_kaggle_account_index", 0)
+        logging.info(f"Using Kaggle account index: {active_kaggle_index}")
+        if not setup_kaggle_api(active_kaggle_index):
+             logging.error(f"Failed to setup Kaggle API for account {active_kaggle_index}. Skipping cycle.")
+             current_state["last_error"] = f"Kaggle API setup failed for account {active_kaggle_index}"
+             current_state["status"] = "error"; save_state(current_state, STATE_FILE_PATH)
+             return current_state
+
+        # <<< USING UPDATED PROMPT GENERATION >>>
+        # 2. Prepare Parameters for Riffusion
+        current_prompt = generate_riffusion_prompt() # Calls the updated function
+        if not current_prompt or current_prompt == "default synth music": # Check for fallback/failure
+             logging.warning(f"Prompt generation resulted in fallback or failure: '{current_prompt}'. Using fallback.")
+             # Decide if we should proceed with fallback or skip cycle
+             # Let's proceed with fallback for now
+             if not current_prompt: current_prompt = "default synth music" # Ensure it's not None
+
+        current_seed = random.randint(0, 2**32 - 1)
+        params_for_kaggle = {
+            "prompt": current_prompt,
+            "seed": current_seed,
+            "num_inference_steps": 50,
+            "guidance_scale": 7.0
+        }
+        logging.info(f"Parameters for Kaggle: {params_for_kaggle}")
+
+        # 3. Trigger Kaggle Notebook Run
+        if trigger_kaggle_notebook(KAGGLE_NOTEBOOK_SLUG, params_for_kaggle):
+            logging.info("Successfully initiated Kaggle notebook run.")
+            current_state["current_step"] = "kaggle_running"
+            current_state["current_prompt"] = current_prompt
+            current_state["last_kaggle_trigger_time"] = datetime.now().isoformat()
+            current_state["retry_count"] = 0
+            save_state(current_state, STATE_FILE_PATH)
         else:
-            logging.warning(f"Log file {LOG_FILE_PATH} not found. Skipping log backup.")
+            logging.error("Failed to initiate Kaggle notebook run.")
+            current_state["last_error"] = "Failed to trigger Kaggle run"
+            current_state["status"] = "error"; save_state(current_state, STATE_FILE_PATH)
 
-    # --- Main Task Execution ---
-    logging.info("Checking for tasks...")
-    # TODO: Implement actual task logic here:
-    # 1. Load state properly (already passed as current_state)
-    # 2. Select instrument/style
-    # 3. Trigger Kaggle generation
-    # 4. Wait and download results
-    # 5. Perform uniqueness check (optional)
-    # 6. Process audio (on Kaggle)
-    # 7. Upload to Drive
-    # 8. Update state/style profile (modify current_state dictionary)
-    # 9. Perform cleanups (Drive, logs)
-    # 10. Handle errors and retries throughout
-    # 11. Save state at the end of the cycle or after significant changes (using save_state)
+    elif current_step == "kaggle_running":
+        # ... (Kaggle running/monitoring logic remains the same) ...
+        logging.info("Kaggle run is currently in progress. Checking status...")
+        run_status = check_kaggle_status(KAGGLE_NOTEBOOK_SLUG)
+        logging.info(f"Kaggle run status: {run_status}")
+        if run_status == "complete":
+            logging.info("Kaggle run completed. Proceeding to download output.")
+            wav_path, img_path = download_kaggle_output(KAGGLE_NOTEBOOK_SLUG, destination_dir=".")
+            if wav_path:
+                logging.info(f"Output WAV downloaded to: {wav_path}")
+                current_state["current_step"] = "processing_output"
+                current_state["last_downloaded_wav"] = wav_path
+                current_state["retry_count"] = 0
+                save_state(current_state, STATE_FILE_PATH)
+            else:
+                logging.error("Kaggle run complete but failed to download output WAV file.")
+                current_state["last_error"] = "Failed to download Kaggle output"
+                current_state["status"] = "error"; current_state["current_step"] = "idle"
+                save_state(current_state, STATE_FILE_PATH)
+        elif run_status == "error" or run_status == "cancelled":
+            logging.error(f"Kaggle run failed with status: {run_status}")
+            current_state["last_error"] = f"Kaggle run failed with status: {run_status}"
+            current_state["status"] = "error"; current_state["current_step"] = "idle"
+            current_state["retry_count"] += 1
+            save_state(current_state, STATE_FILE_PATH)
+        elif run_status == "running" or run_status == "queued":
+            logging.info(f"Kaggle run is still {run_status}. Waiting for next cycle.")
+            pass
+        else:
+            logging.error("Failed to get Kaggle run status. Will retry next cycle.")
+            current_state["retry_count"] += 1
+            save_state(current_state, STATE_FILE_PATH)
 
-    logging.info("Simulating task execution...")
-    time.sleep(10) # Placeholder delay
-    # Example of modifying state:
-    # current_state["total_tracks_generated"] += 1
+    elif current_step == "processing_output":
+         # ... (Processing output logic remains the same placeholder) ...
+         logging.info("Processing downloaded Kaggle output...")
+         pass # Placeholder for now
 
+    else:
+        # ... (Unknown step logic remains the same) ...
+        logging.warning(f"Unknown current_step in state: '{current_step}'. Resetting to idle.")
+        current_state["current_step"] = "idle"
+        save_state(current_state, STATE_FILE_PATH)
+
+    # --- Cycle End ---
     logging.info(f"--- Cycle End: {datetime.now()} ---")
-
-    # Save state at the end of a successful cycle
-    # TODO: Move this save call to appropriate places after actual tasks are done
-    save_state(current_state, STATE_FILE_PATH)
-
-    # Return the potentially modified state
     return current_state
 
 
 def main():
-    """Main function to run the application loop."""
+    # ... (main function remains the same) ...
     logging.info("Starting AI Music Orchestrator...")
-
-    # --- Authenticate Google Drive on Startup ---
     gdrive_service = authenticate_gdrive()
-    if not gdrive_service:
-        # Decide how critical backups are. Exit for now.
-        logging.critical("Failed to authenticate Google Drive. Backups will not work. Exiting.")
-        sys.exit(1)
-    else:
-        logging.info("Google Drive authenticated successfully.")
-    # -----------------------------------------
-
-    # TODO: Send startup message via Telegram
-
-    # Load initial state AFTER potential auth flow interaction
+    if not gdrive_service: logging.critical("Failed to authenticate Google Drive. Exiting."); sys.exit(1)
+    else: logging.info("Google Drive authenticated successfully.")
     state = load_state(STATE_FILE_PATH)
     logging.info(f"Initial state loaded: Status='{state.get('status', 'N/A')}'")
-
-
     while True:
         try:
-            # Pass state and service to the cycle function, get updated state back
             state = run_main_cycle(state, gdrive_service)
-
-            # Check if the cycle function set the status to 'stopped'
             if state.get("status") == "stopped":
-                 logging.info("System stopped gracefully by run_main_cycle. Exiting main loop.")
-                 break # Exit the while loop
-
-            # --- Sleep Interval ---
-            # TODO: Make sleep duration configurable
-            sleep_duration_seconds = 60 * 5 # e.g., 5 minutes
+                 logging.info("System stopped gracefully. Exiting main loop.")
+                 break
+            sleep_duration_seconds = 60 * 5
             logging.info(f"Sleeping for {sleep_duration_seconds} seconds...")
             time.sleep(sleep_duration_seconds)
-
         except KeyboardInterrupt:
             logging.info("\nCtrl+C detected. Exiting gracefully...")
-            # Try to save final state if possible
-            state["status"] = "stopped"
-            save_state(state, STATE_FILE_PATH)
-            # TODO: Send shutdown message via Telegram
+            state["status"] = "stopped"; save_state(state, STATE_FILE_PATH)
             sys.exit(0)
         except Exception as e:
-            # Catch unexpected errors in the main loop
-            logging.critical(f"CRITICAL ERROR in main loop: {e}", exc_info=True) # Log traceback
-            # TODO: Send critical error message via Telegram
-            # Decide on recovery: continue loop, exit, etc.
+            logging.critical(f"CRITICAL ERROR in main loop: {e}", exc_info=True)
             logging.info("Attempting to continue after 1 minute delay...")
-            time.sleep(60) # Delay before potentially retrying the loop
-
+            time.sleep(60)
     logging.info("AI Music Orchestrator main loop finished.")
 
-# --- Script Entry Point ---
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
