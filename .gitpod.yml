@@ -1,0 +1,29 @@
+# .gitpod.yml - Configuration for Gitpod Fallback Environment
+
+# Specify tasks to run on workspace start
+tasks:
+  - name: Setup and Run
+    init: |
+      echo "Setting up Python environment..."
+      # Optional: Specify Python version if needed (e.g., pyenv local 3.10)
+      echo "Installing dependencies..."
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      echo "Setup complete. Workspace ready."
+    # Command to run when the workspace starts (e.g., automatically start the script)
+    # You might want to comment this out initially to manually start after setting secrets
+    # command: |
+    #   echo "Attempting to start main script..."
+    #   python main.py
+
+# Define ports to expose (if needed, e.g., if using Flask later)
+# ports:
+#   - port: 8080 # Example port if Flask runs on 8080
+#     onOpen: open-preview
+
+# Configure VS Code extensions (optional, but recommended)
+vscode:
+  extensions:
+    - ms-python.python
+    - ms-toolsai.jupyter
+    # Add other useful extensions if desired

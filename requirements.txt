@@ -5,3 +5,4 @@ requests # Add requests if not already added by Replit
 kaggle # Add kaggle if not already added
 # Add python-telegram-bot later when we implement bot logic fully
 spotipy
+python-telegram-bot
