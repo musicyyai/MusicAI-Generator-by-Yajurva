@@ -7,5 +7,4 @@ kaggle # Add kaggle if not already added
 spotipy
 python-telegram-bot
 google-auth
-requests
 telegram
