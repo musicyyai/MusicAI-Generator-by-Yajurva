@@ -1,10 +1,10 @@
-# main.py (Updated for Step 8.3.2 - Log Rotation)
+# main.py (Updated for Step 6.7.5 - Implement /exit_fallback command)
 
 import os
 import json
 import time
 import logging
-from logging.handlers import RotatingFileHandler # <<< ADDED
+from logging.handlers import RotatingFileHandler
 import sys
 import requests
 import subprocess
@@ -20,26 +20,19 @@ from telegram.constants import ParseMode
 
 # Imports from utils and config
 from utils import ( load_state, save_state, authenticate_gdrive, upload_to_gdrive, setup_kaggle_api, trigger_kaggle_notebook, download_kaggle_output, check_kaggle_status, get_spotify_trending_keywords, is_unique_enough, get_gdrive_files, delete_gdrive_file, load_style_profile, save_style_profile, retry_operation, send_telegram_message )
-from config import ( GDRIVE_BACKUP_FOLDER_ID, PROMPT_GENRES, PROMPT_INSTRUMENTS, PROMPT_MOODS, PROMPT_TEMPLATES, UNIQUENESS_CHECK_ENABLED, UNIQUENESS_FINGERPRINT_COUNT, UNIQUENESS_SIMILARITY_THRESHOLD, NUM_KAGGLE_ACCOUNTS, MAX_DRIVE_FILES, MAX_DRIVE_FILE_AGE_DAYS, STYLE_PROFILE_RESET_TRACK_COUNT, ESTIMATED_KAGGLE_RUN_HOURS, KAGGLE_WEEKLY_GPU_QUOTA, KAGGLE_USAGE_BUFFER, HEALTH_CHECK_INTERVAL_MINUTES, INTERVENTION_TIMEOUT_MINUTES )
+from config import ( GDRIVE_BACKUP_FOLDER_ID, PROMPT_GENRES, PROMPT_INSTRUMENTS, PROMPT_MOODS, PROMPT_TEMPLATES, UNIQUENESS_CHECK_ENABLED, UNIQUENESS_FINGERPRINT_COUNT, UNIQUENESS_SIMILARITY_THRESHOLD, NUM_KAGGLE_ACCOUNTS, MAX_DRIVE_FILES, MAX_DRIVE_FILE_AGE_DAYS, STYLE_PROFILE_RESET_TRACK_COUNT, ESTIMATED_KAGGLE_RUN_HOURS, KAGGLE_WEEKLY_GPU_QUOTA, KAGGLE_USAGE_BUFFER, HEALTH_CHECK_INTERVAL_MINUTES, INTERVENTION_TIMEOUT_MINUTES, DRY_RUN )
 
-# --- Logging Configuration --- ## <<< MODIFIED >>> ##
-LOG_FILE_PATH = "system_log.txt"
-LOG_FORMAT = '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
-LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
-LOG_BACKUP_COUNT = 3
-
+# --- Logging Configuration ---
+LOG_FILE_PATH = "system_log.txt"; LOG_FORMAT = '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
+LOG_MAX_BYTES = 5 * 1024 * 1024; LOG_BACKUP_COUNT = 3
 formatter = logging.Formatter(LOG_FORMAT)
 file_handler = RotatingFileHandler(LOG_FILE_PATH, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding='utf-8')
-file_handler.setFormatter(formatter)
-file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(formatter); file_handler.setLevel(logging.INFO)
 console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(formatter)
-console_handler.setLevel(logging.INFO)
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+console_handler.setFormatter(formatter); console_handler.setLevel(logging.INFO)
+logger = logging.getLogger(); logger.setLevel(logging.INFO)
 if logger.hasHandlers(): logger.handlers.clear()
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
+logger.addHandler(file_handler); logger.addHandler(console_handler)
 logging.info("Logging configured with RotatingFileHandler.")
 
 # --- Load Secrets ---
@@ -59,7 +52,7 @@ try: GOOGLE_CREDS_INFO = json.loads(GOOGLE_CREDS_JSON_STR); logging.info("GDrive
 except json.JSONDecodeError as e: logging.critical(f"Failed parse GDrive JSON: {e}", exc_info=True); sys.exit(1)
 
 # --- Default State Definition ---
-DEFAULT_STATE = { "status": "stopped", "active_kaggle_account_index": 0, "active_drive_account_index": 0, "current_step": "idle", "current_prompt": None, "last_kaggle_run_id": None, "last_kaggle_trigger_time": None, "last_downloaded_mp3": None, "last_downloaded_json": None, "retry_count": 0, "total_tracks_generated": 0, "style_profile_id": "default", "fallback_active": False, "kaggle_usage": [{"account_index": i, "gpu_hours_used_this_week": 0.0, "last_reset_time": None} for i in range(NUM_KAGGLE_ACCOUNTS)], "last_error": None, "_checksum": None, "recent_fingerprints": [], "last_gdrive_cleanup_time": None, "last_health_check_time": None, "intervention_pending_since": None }
+DEFAULT_STATE = { "status": "stopped", "active_kaggle_account_index": 0, "active_drive_account_index": 0, "current_step": "idle", "current_prompt": None, "last_kaggle_run_id": None, "last_kaggle_trigger_time": None, "last_downloaded_mp3": None, "last_downloaded_json": None, "retry_count": 0, "total_tracks_generated": 0, "style_profile_id": "default", "fallback_active": False, "kaggle_usage": [{"account_index": i, "gpu_hours_used_this_week": 0.0, "last_reset_time": None, "suspended": False} for i in range(NUM_KAGGLE_ACCOUNTS)], "last_error": None, "_checksum": None, "recent_fingerprints": [], "last_gdrive_cleanup_time": None, "last_health_check_time": None, "intervention_pending_since": None }
 STATE_FILE_PATH = "state.txt"
 
 # --- Constants ---
@@ -77,12 +70,20 @@ _shutdown_requested = False
 
 # --- Helper Functions ---
 def rotate_kaggle_account(current_state, reason="Unknown"):
+    # ... (Function remains unchanged) ...
     if NUM_KAGGLE_ACCOUNTS <= 1: logging.warning("Rotation requested, but only 1 account."); return current_state
-    original_index = current_state.get("active_kaggle_account_index", 0); next_index = (original_index + 1) % NUM_KAGGLE_ACCOUNTS
-    current_state["active_kaggle_account_index"] = next_index; current_state["retry_count"] = 0
-    logging.warning(f"Rotating Kaggle account from {original_index} to {next_index}. Reason: {reason}")
-    send_telegram_message(f"WARNING: Rotating Kaggle account from {original_index} to {next_index}. Reason: {reason}", level="WARNING")
-    save_state(current_state, STATE_FILE_PATH); return current_state
+    original_index = current_state.get("active_kaggle_account_index", 0); usage_list = current_state.get("kaggle_usage", []); next_index = original_index
+    for i in range(NUM_KAGGLE_ACCOUNTS):
+        next_index = (next_index + 1) % NUM_KAGGLE_ACCOUNTS; is_suspended = False
+        if 0 <= next_index < len(usage_list) and isinstance(usage_list[next_index], dict): is_suspended = usage_list[next_index].get("suspended", False)
+        if not is_suspended:
+             current_state["active_kaggle_account_index"] = next_index; current_state["retry_count"] = 0
+             logging.warning(f"Rotating Kaggle account from {original_index} to {next_index} (Skipped {i} suspended). Reason: {reason}")
+             send_telegram_message(f"WARNING: Rotating Kaggle account from {original_index} to {next_index}. Reason: {reason}", level="WARNING")
+             save_state(current_state, STATE_FILE_PATH); return current_state
+    logging.error(f"Rotation failed: All other accounts suspended. Staying on index {original_index}.")
+    send_telegram_message(f"ERROR: Rotation failed - all other accounts suspended!", level="ERROR")
+    current_state["status"] = "error"; current_state["last_error"] = "Rotation failed: All other accounts suspended."; save_state(current_state, STATE_FILE_PATH); return current_state
 
 # --- Prompt Generation Function ---
 def generate_riffusion_prompt(use_spotify=True, style_profile=None):
@@ -208,7 +209,7 @@ def perform_gdrive_cleanup(current_state, gdrive_service):
 _last_backup_time = None
 
 def run_main_cycle(gdrive_service):
-    # ... (Function remains unchanged) ...
+    # ... (Function remains unchanged, including intervention timeout check) ...
     global _shutdown_requested, _last_backup_time
     cycle_start_time = datetime.now(timezone.utc)
     logging.info(f"--- Cycle Start: {cycle_start_time.isoformat()} ---")
@@ -232,6 +233,7 @@ def run_main_cycle(gdrive_service):
                             except ValueError: logging.warning(f"Bad last_reset_time for account {i}. Resetting."); needs_reset = True
                         if needs_reset:
                             usage_list[i]["gpu_hours_used_this_week"] = 0.0; usage_list[i]["last_reset_time"] = now_utc.isoformat(); state_changed = True
+                            if usage_list[i].get("suspended"): logging.warning(f"Unsuspending Kaggle account {i}."); usage_list[i]["suspended"] = False # Unsuspend on reset
                     else: logging.warning(f"Item index {i} in kaggle_usage not dict.")
                 if state_changed:
                     logging.info("Kaggle weekly usage counters reset.")
@@ -341,19 +343,28 @@ def run_main_cycle(gdrive_service):
             # ... (idle step logic remains unchanged) ...
             logging.info("State: Idle. Preparing Kaggle run.")
             logging.info(f"Attempting to use Kaggle account index: {active_kaggle_index}")
-            if not setup_kaggle_api(active_kaggle_index): err_msg = f"Kaggle API setup failed (Index {active_kaggle_index})"; logging.error(err_msg); current_state["last_error"] = err_msg; send_telegram_message(f"ERROR: {err_msg}. Rotating.", level="ERROR"); current_state = rotate_kaggle_account(current_state, reason="API Setup Failure"); return
+            if not setup_kaggle_api(active_kaggle_index):
+                err_msg = f"Kaggle API setup failed (Index {active_kaggle_index})"; logging.error(err_msg); current_state["last_error"] = err_msg;
+                try:
+                    usage_list = current_state.get("kaggle_usage", []);
+                    if 0 <= active_kaggle_index < len(usage_list) and isinstance(usage_list[active_kaggle_index], dict):
+                        if not usage_list[active_kaggle_index].get("suspended"): usage_list[active_kaggle_index]["suspended"] = True; current_state["kaggle_usage"] = usage_list; logging.warning(f"Marking Kaggle account {active_kaggle_index} as SUSPENDED."); send_telegram_message(f"WARNING: Marking Kaggle account {active_kaggle_index} as SUSPENDED.", level="WARNING"); save_state(current_state, STATE_FILE_PATH)
+                    else: logging.error(f"Could not mark account {active_kaggle_index} as suspended.")
+                except Exception as suspend_e: logging.error(f"Error marking account {active_kaggle_index} as suspended: {suspend_e}", exc_info=True)
+                send_telegram_message(f"ERROR: {err_msg}. Rotating.", level="ERROR"); current_state = rotate_kaggle_account(current_state, reason="API Setup Failure"); return
             quota_check_passed = False; initial_check_index = active_kaggle_index; accounts_checked = 0
             while accounts_checked < NUM_KAGGLE_ACCOUNTS:
                 current_active_index_in_loop = current_state.get("active_kaggle_account_index", 0); accounts_checked += 1; logging.info(f"Checking quota account {current_active_index_in_loop} (Check {accounts_checked}/{NUM_KAGGLE_ACCOUNTS})")
                 try:
                     usage_list = current_state.get("kaggle_usage", []);
                     if not (0 <= current_active_index_in_loop < len(usage_list)): logging.error(f"Quota check failed: Invalid index {current_active_index_in_loop}."); current_state["status"] = "error"; current_state["last_error"] = f"Invalid Kaggle index {current_active_index_in_loop}."; save_state(current_state, STATE_FILE_PATH); send_telegram_message(f"CRITICAL: Invalid Kaggle index {current_active_index_in_loop}.", level="CRITICAL"); return
+                    if usage_list[current_active_index_in_loop].get("suspended", False): logging.warning(f"Account {current_active_index_in_loop} suspended. Rotating."); current_state = rotate_kaggle_account(current_state, reason="Skipping Suspended Account"); continue
                     current_usage = usage_list[current_active_index_in_loop].get("gpu_hours_used_this_week", 0.0); projected_usage = current_usage + ESTIMATED_KAGGLE_RUN_HOURS; quota_limit = KAGGLE_WEEKLY_GPU_QUOTA * KAGGLE_USAGE_BUFFER; logging.info(f"Account {current_active_index_in_loop}: Current={current_usage:.2f}h, Projected={projected_usage:.2f}h, Limit={quota_limit:.2f}h")
                     if projected_usage <= quota_limit: logging.info(f"Quota check passed account {current_active_index_in_loop}."); quota_check_passed = True; active_kaggle_index = current_active_index_in_loop; break
                     else: logging.warning(f"Quota limit for account {current_active_index_in_loop}. Rotating."); current_state = rotate_kaggle_account(current_state, reason="Quota Limit Reached")
                 except Exception as quota_e: logging.error(f"Error quota check account {current_active_index_in_loop}: {quota_e}", exc_info=True); send_telegram_message(f"ERROR: Exception quota check account {current_active_index_in_loop}. Rotating.", level="ERROR"); current_state = rotate_kaggle_account(current_state, reason="Quota Check Error")
                 if accounts_checked >= NUM_KAGGLE_ACCOUNTS and current_state.get("active_kaggle_account_index", 0) == initial_check_index and not quota_check_passed: logging.error("Quota check loop completed full rotation."); break
-            if not quota_check_passed: err_msg = "All Kaggle accounts exhausted quota."; logging.critical(f"CRITICAL: {err_msg} Stopping."); current_state["status"] = "stopped_exhausted"; current_state["last_error"] = err_msg; save_state(current_state, STATE_FILE_PATH); send_telegram_message(f"CRITICAL: {err_msg} Script stopped.", level="CRITICAL"); return
+            if not quota_check_passed: err_msg = "All Kaggle accounts exhausted quota or suspended."; logging.critical(f"CRITICAL: {err_msg} Stopping."); current_state["status"] = "stopped_exhausted"; current_state["last_error"] = err_msg; save_state(current_state, STATE_FILE_PATH); send_telegram_message(f"CRITICAL: {err_msg} Script stopped.", level="CRITICAL"); return
             logging.info(f"Proceeding with Kaggle run using account index: {active_kaggle_index}")
             style_profile = load_style_profile()
             if style_profile:
@@ -374,13 +385,14 @@ def run_main_cycle(gdrive_service):
                 current_state["status"] = "error"; current_state["intervention_pending_since"] = datetime.now(timezone.utc).isoformat(); save_state(current_state, STATE_FILE_PATH); return
 
         elif current_step == "kaggle_running":
+            # ... (kaggle_running logic remains unchanged) ...
             logging.info("State: Kaggle Running. Checking status...")
             run_status = retry_operation( check_kaggle_status, args=(KAGGLE_NOTEBOOK_SLUG,), max_retries=4, delay_seconds=15, operation_name="Check Kaggle Status" )
             if run_status == "complete":
                 logging.info("Kaggle run complete. Updating usage and downloading output.")
                 try:
                     usage_list = current_state.get("kaggle_usage", [])
-                    if len(usage_list) < NUM_KAGGLE_ACCOUNTS: logging.warning("Kaggle usage list mismatch. Rebuilding."); usage_list = [{"account_index": i, "gpu_hours_used_this_week": 0.0, "last_reset_time": None} for i in range(NUM_KAGGLE_ACCOUNTS)]
+                    if len(usage_list) < NUM_KAGGLE_ACCOUNTS: logging.warning("Kaggle usage list mismatch. Rebuilding."); usage_list = [{"account_index": i, "gpu_hours_used_this_week": 0.0, "last_reset_time": None, "suspended": False} for i in range(NUM_KAGGLE_ACCOUNTS)]
                     if 0 <= active_kaggle_index < len(usage_list): run_duration_hours = ESTIMATED_KAGGLE_RUN_HOURS; usage_list[active_kaggle_index]["gpu_hours_used_this_week"] = usage_list[active_kaggle_index].get("gpu_hours_used_this_week", 0.0) + run_duration_hours; current_state["kaggle_usage"] = usage_list; logging.info(f"Updated Kaggle usage account {active_kaggle_index}: {usage_list[active_kaggle_index]['gpu_hours_used_this_week']:.2f}h estimated."); save_state(current_state, STATE_FILE_PATH)
                     else: logging.error(f"Could not update Kaggle usage: index {active_kaggle_index} out of bounds ({len(usage_list)}).")
                 except Exception as usage_e: logging.error(f"Error updating Kaggle usage: {usage_e}", exc_info=True)
@@ -400,6 +412,7 @@ def run_main_cycle(gdrive_service):
                 current_state["status"] = "error"; current_state["intervention_pending_since"] = datetime.now(timezone.utc).isoformat(); save_state(current_state, STATE_FILE_PATH); return
 
         elif current_step == "processing_output":
+            # ... (processing_output logic remains unchanged) ...
             logging.info("State: Processing Output.")
             downloaded_mp3 = current_state.get("last_downloaded_mp3"); downloaded_json = current_state.get("last_downloaded_json")
             proceed_with_upload = False; upload_success = False; gdrive_filename = None
@@ -554,7 +567,8 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 used_hours = account_usage.get("gpu_hours_used_this_week", 0.0); remaining_hours = max(0.0, quota_limit - used_hours); remaining_buffered = max(0.0, buffer_limit - used_hours); last_reset_iso = account_usage.get("last_reset_time"); reset_time_str = "Never"; next_reset_str = "Unknown"
                 if last_reset_iso: try: last_reset_dt = datetime.fromisoformat(last_reset_iso).astimezone(timezone.utc); reset_time_str = last_reset_dt.strftime('%Y-%m-%d %H:%M UTC'); next_reset_dt = last_reset_dt + timedelta(days=7); next_reset_str = next_reset_dt.strftime('%Y-%m-%d %H:%M UTC'); except ValueError: reset_time_str = "Invalid timestamp"
                 active_marker = " ✅" if i == active_index else ""
-                lines.append(f"*Account {i}{active_marker}:*")
+                suspended_marker = " ⚠️ Suspended" if account_usage.get("suspended") else ""
+                lines.append(f"*Account {i}{active_marker}{suspended_marker}:*")
                 lines.append(f"  \\- Used: `{escape_md(f'{used_hours:.2f}')}` hours")
                 lines.append(f"  \\- Remaining \\(Buffered\\): `{escape_md(f'{remaining_buffered:.2f}')}` hours")
                 lines.append(f"  \\- Last Reset: `{escape_md(reset_time_str)}`")
@@ -685,98 +699,87 @@ async def restart_task_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if update.message: await update.message.reply_text(reply_message)
     elif update.callback_query: await update.callback_query.edit_message_text(reply_message)
 
-async def exit_fallback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logging.info(f"Received /exit_fallback command from user {update.effective_user.id}")
-    await update.message.reply_text('Exit Fallback command received. Implementation pending (Task 6.7.5).')
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: ## <<< MODIFIED >>> ##
-    """Handles button presses (CallbackQuery)."""
-    query = update.callback_query
-    await query.answer() # Answer the callback query first
-    callback_data = query.data
+async def exit_fallback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: ## <<< MODIFIED >>> ##
+    """Handles the /exit_fallback command to stop the script if running in fallback mode."""
+    global _shutdown_requested
     user_id = update.effective_user.id
-    logging.info(f"Received button press data: {callback_data} from user {user_id}")
-
-    # --- Handle Callback Data ---
+    logging.info(f"Received /exit_fallback command from user {user_id}")
+    reply_message = ""
     try:
         current_state = load_state(STATE_FILE_PATH)
-        action_taken = False
-        new_reply_text = f"Processing action: {callback_data}..." # Initial reply
-        state_modified = False # Flag to track if state needs saving
+        is_fallback = current_state.get("fallback_active", False)
 
+        if is_fallback:
+            reply_message = "Fallback environment detected. Initiating shutdown..."
+            logging.warning("Exit fallback command received. Initiating shutdown sequence.")
+            current_state["status"] = "stopping"
+            _shutdown_requested = True # Signal the orchestrator loop
+            if save_state(current_state, STATE_FILE_PATH):
+                 logging.info("Status set to 'stopping' by /exit_fallback command.")
+                 reply_message += "\nStatus set to stopping. Please manually stop the Gitpod workspace if it doesn't exit automatically soon."
+            else:
+                 reply_message = "ERROR: Failed to save state during fallback exit. Manual stop required."
+                 logging.error("Failed to save state during /exit_fallback.")
+        else:
+            reply_message = "Command ignored: Script is not running in fallback mode."
+            logging.info("Ignoring /exit_fallback command as not in fallback mode.")
+
+    except Exception as e:
+        logging.error(f"Error processing /exit_fallback command: {e}", exc_info=True)
+        reply_message = "An internal error occurred while processing the /exit_fallback command."
+
+    if update.message: await update.message.reply_text(reply_message)
+    elif update.callback_query: await update.callback_query.edit_message_text(reply_message)
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # ... (Function remains unchanged) ...
+    query = update.callback_query; await query.answer(); callback_data = query.data; user_id = update.effective_user.id
+    logging.info(f"Received button press data: {callback_data} from user {user_id}")
+    try:
+        current_state = load_state(STATE_FILE_PATH); action_taken = False; new_reply_text = f"Processing action: {callback_data}..."; state_modified = False
         if callback_data == CALLBACK_RETRY_OPERATION:
-            logging.info("Button: Handling retry operation...")
-            current_state["retry_count"] = 0; current_state["last_error"] = None; current_state["intervention_pending_since"] = None
+            logging.info("Button: Handling retry operation..."); current_state["retry_count"] = 0; current_state["last_error"] = None; current_state["intervention_pending_since"] = None
             if current_state["status"] == "error": current_state["status"] = "running"
-            action_taken = True; state_modified = True
-            new_reply_text = "Retry initiated. Cleared last error and retry count."
-
+            action_taken = True; state_modified = True; new_reply_text = "Retry initiated. Cleared last error and retry count."
         elif callback_data == CALLBACK_SKIP_STEP:
-            logging.info("Button: Handling skip step...")
-            current_state["current_step"] = "idle"; current_state["retry_count"] = 0; current_state["last_error"] = "Step skipped by user."; current_state["intervention_pending_since"] = None
+            logging.info("Button: Handling skip step..."); current_state["current_step"] = "idle"; current_state["retry_count"] = 0; current_state["last_error"] = "Step skipped by user."; current_state["intervention_pending_since"] = None
             if current_state["status"] == "error": current_state["status"] = "running"
-            action_taken = True; state_modified = True
-            new_reply_text = "Skip initiated. Current step set to idle."
+            action_taken = True; state_modified = True; new_reply_text = "Skip initiated. Current step set to idle."
             try:
                 dl_mp3 = current_state.get("last_downloaded_mp3"); dl_json = current_state.get("last_downloaded_json")
                 if dl_mp3 and os.path.exists(dl_mp3): os.remove(dl_mp3); logging.info(f"Cleaned up {dl_mp3} on skip.")
                 if dl_json and os.path.exists(dl_json): os.remove(dl_json); logging.info(f"Cleaned up {dl_json} on skip.")
                 current_state["last_downloaded_mp3"] = None; current_state["last_downloaded_json"] = None
             except OSError as e: logging.warning(f"Error cleaning up files during skip: {e}")
-
         elif callback_data == CALLBACK_ROTATE_ACCOUNT:
-            logging.info("Button: Handling rotate account...")
-            original_index = current_state.get("active_kaggle_account_index", "N/A")
+            logging.info("Button: Handling rotate account..."); original_index = current_state.get("active_kaggle_account_index", "N/A")
             current_state = rotate_kaggle_account(current_state, reason="Manual Rotation via Button")
             if current_state["status"] == "error": current_state["status"] = "running"
-            current_state["intervention_pending_since"] = None # Clear intervention flag
-            action_taken = True # State saved within rotate function
-            new_reply_text = f"Account rotation initiated. Switched from {original_index} to {current_state.get('active_kaggle_account_index')}."
-
+            current_state["intervention_pending_since"] = None; action_taken = True; new_reply_text = f"Account rotation initiated. Switched from {original_index} to {current_state.get('active_kaggle_account_index')}."
         elif callback_data == CALLBACK_CHECK_DRIVE:
-             logging.info("Button: Handling Check Drive...")
-             action_taken = True; state_modified = False
-             new_reply_text = "Attempting to check Google Drive connection..."
-             await query.edit_message_text(text=new_reply_text)
+             logging.info("Button: Handling Check Drive..."); action_taken = True; state_modified = False; new_reply_text = "Attempting to check Google Drive connection..."; await query.edit_message_text(text=new_reply_text)
              gdrive_service_check = retry_operation(authenticate_gdrive, max_retries=1, delay_seconds=2, operation_name="Manual GDrive Check")
              if gdrive_service_check:
                   def gdrive_about_call(): return gdrive_service_check.about().get(fields='user(displayName)').execute()
                   about_info = retry_operation(gdrive_about_call, max_retries=0, operation_name="Manual GDrive About Call")
-                  if about_info:
-                       user_name = about_info.get("user", {}).get("displayName", "Unknown User")
-                       new_reply_text = f"Google Drive check successful! Connected as: {user_name}"
-                       logging.info("Manual Google Drive check successful.")
+                  if about_info: user_name = about_info.get("user", {}).get("displayName", "Unknown User"); new_reply_text = f"Google Drive check successful! Connected as: {user_name}"; logging.info("Manual Google Drive check successful.")
                   else: new_reply_text = "Google Drive check failed: Could not retrieve account info."; logging.error("Manual GDrive check failed (about call).")
              else: new_reply_text = "Google Drive check failed: Authentication failed."; logging.error("Manual GDrive check failed (auth).")
-
         elif callback_data == CALLBACK_VIEW_STATE:
-             logging.info("Button: Handling View State...")
-             action_taken = True; state_modified = False
+             logging.info("Button: Handling View State..."); action_taken = True; state_modified = False
              try:
                   state_to_view = current_state.copy(); state_to_view.pop("recent_fingerprints", None)
-                  state_str = json.dumps(state_to_view, indent=2)
-                  def escape_md_code(text): return text.replace('\\', '\\\\').replace('`', '\\`')
-                  escaped_state = escape_md_code(state_str)
+                  state_str = json.dumps(state_to_view, indent=2); def escape_md_code(text): return text.replace('\\', '\\\\').replace('`', '\\`'); escaped_state = escape_md_code(state_str)
                   if len(escaped_state) > 4000: escaped_state = escaped_state[:4000] + "\n... (truncated)"
                   new_reply_text_state = f"*Current State:*\n```json\n{escaped_state}\n```"
                   await context.bot.send_message(chat_id=query.message.chat_id, text=new_reply_text_state, parse_mode=ParseMode.MARKDOWN_V2)
                   new_reply_text = "Current state sent as a new message."
              except Exception as view_e: logging.error(f"Error formatting/sending state: {view_e}", exc_info=True); new_reply_text = "Error retrieving/formatting state."
-
-        else:
-            logging.warning(f"Unknown callback data received: {callback_data}")
-            new_reply_text = f"Unknown action: {callback_data}"
-
-        # Save state if modified by the action (and not already saved)
+        else: logging.warning(f"Unknown callback data received: {callback_data}"); new_reply_text = f"Unknown action: {callback_data}"
         if state_modified:
-            if not save_state(current_state, STATE_FILE_PATH):
-                logging.error("Failed to save state after button action!")
-                new_reply_text += "\nERROR: Failed to save state!"
-
-        # Edit the original message unless we sent a new one
-        if callback_data != CALLBACK_VIEW_STATE:
-             await query.edit_message_text(text=new_reply_text)
-
+            if not save_state(current_state, STATE_FILE_PATH): logging.error("Failed to save state after button action!"); new_reply_text += "\nERROR: Failed to save state!"
+        if callback_data != CALLBACK_VIEW_STATE: await query.edit_message_text(text=new_reply_text)
     except Exception as e:
         logging.error(f"Error processing button callback {callback_data}: {e}", exc_info=True)
         try: await query.edit_message_text(text=f"Error processing action: {callback_data}. Check logs.")
